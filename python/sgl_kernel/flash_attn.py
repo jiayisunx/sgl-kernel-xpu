@@ -1,7 +1,34 @@
+from contextlib import nullcontext
 from typing import List, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+
+
+def _default_device_fastpath_context(tensors):
+    if (
+        not tensors
+        or type(tensors[0]) is not torch.Tensor
+        or any(t is not None and type(t) is not torch.Tensor for t in tensors)
+    ):
+        return nullcontext()
+    get_mode_stack = getattr(torch.overrides, "_get_current_function_mode_stack", None)
+    disable_torch_function = getattr(torch._C, "DisableTorchFunction", None)
+    if get_mode_stack is None or disable_torch_function is None:
+        return nullcontext()
+
+    mode_stack = get_mode_stack()
+    if len(mode_stack) != 1:
+        return nullcontext()
+    mode = mode_stack[0]
+    mode_type = type(mode)
+    if (
+        mode_type.__module__ != "torch.utils._device"
+        or mode_type.__name__ != "DeviceContext"
+        or mode.device.type != tensors[0].device.type
+    ):
+        return nullcontext()
+    return disable_torch_function()
 
 
 def is_fa3_supported(device=None) -> bool:
@@ -98,6 +125,53 @@ def flash_attn_decode(
 ):
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
+
+
+def flash_attn_paged_decode(
+    q,
+    k_cache,
+    v_cache,
+    cu_seqlens_q,
+    cache_seqlens,
+    max_seqlen_k,
+    page_table,
+    softmax_scale,
+    window_size_left,
+    window_size_right,
+    out,
+    *,
+    causal=False,
+    softcap=0.0,
+    num_splits=0,
+    pack_gqa=None,
+    sm_margin=0,
+):
+    """Launch the preallocated-output paged single-token decode path directly.
+
+    This narrow entry point is for callers that already have packed single-token
+    queries and do not need rotary, FP8 descales, or other optional attention
+    features. The general :func:`flash_attn_with_kvcache` API remains the
+    compatibility path for those cases.
+    """
+    torch.ops.sgl_kernel.fwd_paged_decode.default(
+        q,
+        k_cache,
+        v_cache,
+        cu_seqlens_q,
+        cache_seqlens,
+        max_seqlen_k,
+        page_table,
+        softmax_scale,
+        causal,
+        window_size_left,
+        window_size_right,
+        softcap,
+        num_splits,
+        pack_gqa,
+        sm_margin,
+        out,
+    )
+    return out
 
 
 def flash_attn_with_kvcache(
@@ -244,6 +318,84 @@ def flash_attn_with_kvcache(
             logsumexp of each row of the matrix QK^T * scaling (e.g., log of the softmax
             normalization factor).
     """
+    fastpath_context = _default_device_fastpath_context(
+        (q, k_cache, v_cache, cu_seqlens_q, cache_seqlens, page_table, out)
+    )
+    with fastpath_context:
+        if (
+            q.device.type == "xpu"
+            and page_table is not None
+            and cu_seqlens_q is not None
+            and isinstance(cache_seqlens, torch.Tensor)
+            and max_seqlen_q == 1
+            and max_seqlen_k is not None
+            and k_cache.shape[1] != 1
+            and k is None
+            and v is None
+            and qv is None
+            and rotary_cos is None
+            and rotary_sin is None
+            and cache_batch_idx is None
+            and cache_leftpad is None
+            and cu_seqlens_k_new is None
+            and rotary_seqlens is None
+            and q_descale is None
+            and k_descale is None
+            and v_descale is None
+            and sinks is None
+            and scheduler_metadata is None
+            and rel_bias is None
+            and not rel_bias_is_sheared
+            and return_softmax_lse is False
+            and q.dim() == 3
+            and q.stride(-1) == 1
+            and k_cache.stride(-1) == 1
+            and v_cache.stride(-1) == 1
+            and cu_seqlens_q.stride(-1) == 1
+            and page_table.stride(-1) == 1
+            and cache_seqlens.stride(-1) == 1
+        ):
+            effective_softmax_scale = (
+                q.shape[-1] ** -0.5 if softmax_scale is None else softmax_scale
+            )
+            if out is None:
+                return torch.ops.sgl_kernel.fwd_paged_decode_alloc.default(
+                    q,
+                    k_cache,
+                    v_cache,
+                    cu_seqlens_q,
+                    cache_seqlens,
+                    max_seqlen_k,
+                    page_table,
+                    effective_softmax_scale,
+                    causal,
+                    window_size[0],
+                    window_size[1],
+                    softcap,
+                    num_splits,
+                    pack_gqa,
+                    sm_margin,
+                )
+            torch.ops.sgl_kernel.fwd_paged_decode.default(
+                q,
+                k_cache,
+                v_cache,
+                cu_seqlens_q,
+                cache_seqlens,
+                max_seqlen_k,
+                page_table,
+                effective_softmax_scale,
+                causal,
+                window_size[0],
+                window_size[1],
+                softcap,
+                num_splits,
+                pack_gqa,
+                sm_margin,
+                out,
+            )
+            return out
+
     assert k_cache.stride(-1) == 1, "k_cache must have contiguous last dimension"
     assert v_cache.stride(-1) == 1, "v_cache must have contiguous last dimension"
     if softmax_scale is None:
@@ -291,20 +443,33 @@ def flash_attn_with_kvcache(
             out=out,
         )
 
-    q, k_cache, k, v = [maybe_contiguous(x) for x in (q, k_cache, k, v)]
+    q = maybe_contiguous(q)
+    k_cache = maybe_contiguous(k_cache)
+    if k is not None:
+        k = maybe_contiguous(k)
+    if v is not None:
+        v = maybe_contiguous(v)
     v_cache = (
         v_cache.contiguous()
         if v_cache.stride(-1) != 1 and v_cache.stride(-3) != 1
         else v_cache
     )
-    cu_seqlens_q, cu_seqlens_k_new = [
-        maybe_contiguous(x) for x in (cu_seqlens_q, cu_seqlens_k_new)
-    ]
-    page_table, cache_batch_idx, cache_leftpad = [
-        maybe_contiguous(x) for x in (page_table, cache_batch_idx, cache_leftpad)
-    ]
-    rotary_cos, rotary_sin = [maybe_contiguous(x) for x in (rotary_cos, rotary_sin)]
-    rotary_seqlens = maybe_contiguous(rotary_seqlens)
+    if cu_seqlens_q is not None:
+        cu_seqlens_q = maybe_contiguous(cu_seqlens_q)
+    if cu_seqlens_k_new is not None:
+        cu_seqlens_k_new = maybe_contiguous(cu_seqlens_k_new)
+    if page_table is not None:
+        page_table = maybe_contiguous(page_table)
+    if cache_batch_idx is not None:
+        cache_batch_idx = maybe_contiguous(cache_batch_idx)
+    if cache_leftpad is not None:
+        cache_leftpad = maybe_contiguous(cache_leftpad)
+    if rotary_cos is not None:
+        rotary_cos = maybe_contiguous(rotary_cos)
+    if rotary_sin is not None:
+        rotary_sin = maybe_contiguous(rotary_sin)
+    if rotary_seqlens is not None:
+        rotary_seqlens = maybe_contiguous(rotary_seqlens)
 
     if cu_seqlens_q is None:  # !is_varlen_q
         cu_seqlens_q = torch.arange(
