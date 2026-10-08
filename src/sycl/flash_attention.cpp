@@ -161,9 +161,8 @@ void mha_fwd_nopage(
 
   int const head_size_rounded = round_up_headdim(head_size);
 
-  c10::DeviceGuard device_guard(q.device());
-
   Arguments params;
+  params.device_id = q.device().index();
   params.is_bf16 = q.dtype() == torch::kBFloat16;
   params.is_fp16 = q.dtype() == torch::kHalf;
 
@@ -470,6 +469,7 @@ void mha_fwd(
   at::Tensor exp_sums;    // [batch, num_head_q, seq_q, num_kv_splits]
   at::Tensor max_logits;  // [batch, num_head_q, seq_q, num_kv_splits]
   Arguments params;
+  params.device_id = q.device().index();
   // num_kv_splits semantics (host-side scalar, no D2H sync):
   //   -1 or 1 -> split-KV disabled, use the non-split FmhaDecodeRunner
   //         0 -> auto: pick a split count from the device-occupancy heuristic
@@ -481,8 +481,18 @@ void mha_fwd(
                              int head_size_v,
                              int max_seqlen_k,
                              int block_size,
-                             int window_size_left) {
-      auto stream = at::xpu::getCurrentXPUStream();
+                             int window_size_left,
+                             c10::DeviceIndex device_id) {
+      int const effective_seqlen_k =
+          window_size_left >= 0 ? std::min(max_seqlen_k, window_size_left + 1) : max_seqlen_k;
+      int const effective_blocks = (effective_seqlen_k + block_size - 1) / block_size;
+      constexpr int kMinBlocksToSplit = 32;
+      constexpr int kAlwaysSplitHeadSizeV = 512;
+      if (effective_blocks <= kMinBlocksToSplit && head_size_v < kAlwaysSplitHeadSizeV) {
+        return 1;
+      }
+
+      auto stream = at::xpu::getCurrentXPUStream(device_id);
       auto queue = stream.queue();
       auto device = queue.get_device();
       int num_xe_cores = device.get_info<sycl::ext::intel::info::device::gpu_slices>() *
@@ -493,15 +503,6 @@ void mha_fwd(
       int num_splits = (parallel_ + cur_parallel_d - 1) / cur_parallel_d;
       if (cur_parallel_d * num_splits > parallel_ && num_splits > 1) {
         num_splits = std::ceil(parallel_2 / static_cast<float>(cur_parallel_d)) - 1;
-      }
-
-      int const effective_seqlen_k =
-          window_size_left >= 0 ? std::min(max_seqlen_k, window_size_left + 1) : max_seqlen_k;
-      int const effective_blocks = (effective_seqlen_k + block_size - 1) / block_size;
-      constexpr int kMinBlocksToSplit = 32;
-      constexpr int kAlwaysSplitHeadSizeV = 512;
-      if (effective_blocks <= kMinBlocksToSplit && head_size_v < kAlwaysSplitHeadSizeV) {
-        return 1;
       }
 
       if (batch_size == 1 && num_heads_q == 8 && num_heads_kv == 1 && head_size_v == 512 && block_size == 64) {
@@ -523,8 +524,8 @@ void mha_fwd(
       int max_splits = std::min(effective_blocks, parallel_);
       return std::min(num_splits, max_splits);
     };
-    num_kv_splits =
-        get_num_splits(batch_size, num_heads, num_heads_k, head_size_v, seqlen_k, page_size, window_size_left);
+    num_kv_splits = get_num_splits(
+        batch_size, num_heads, num_heads_k, head_size_v, seqlen_k, page_size, window_size_left, q.device().index());
   }
   // Only split when the resolved count is > 1; -1 / 1 fall back to non-split.
   params.use_split_kv = num_kv_splits > 1;
@@ -543,7 +544,6 @@ void mha_fwd(
 
   // Otherwise the kernel will be launched from cuda:0 device
   // Cast to char to avoid compiler warning about narrowing
-  c10::DeviceGuard device_guard(q.device());
 
   // ``softmax_lse`` is caller-provided; empty (numel == 0) when the LSE was not
   // requested, in which case the kernel skips every LSE write.
@@ -848,8 +848,6 @@ void mha_fwd_nopage(
   bool const return_softmax_lse = softmax_lse.has_value();
 
   int const head_size_rounded = round_up_headdim(head_size);
-
-  c10::DeviceGuard device_guard(q.device());
 
   Arguments params;
   params.is_bf16 = q.dtype() == torch::kBFloat16;
@@ -1557,7 +1555,7 @@ SGL_KERNEL_EXPORT void mha_fwd(
   const double bytes_pv =
       static_cast<double>(num_heads_kv) * batched_seq_kv * static_cast<double>(head_dim_v) * elem_sz +
       static_cast<double>(num_heads_q) * batched_eff_seq_q * static_cast<double>(head_dim_v) * elem_sz;
-  auto profiling_queue = at::xpu::getCurrentXPUStream().queue();
+  auto profiling_queue = at::xpu::getCurrentXPUStream(q.device().index()).queue();
   SGL_KERNEL_PERF_SCOPE("mha_fwd", profiling_queue, bytes_qk + bytes_pv, flops);
 #endif
 
@@ -1630,5 +1628,190 @@ SGL_KERNEL_EXPORT void mha_fwd(
     // Non-uniform paged batches fall back to chunkprefill.
     dispatch(chunkprefill::mha_fwd);
   }
+}
+
+SGL_KERNEL_EXPORT void mha_fwd_paged_decode(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& cache_seqlens,
+    int max_seqlen_k,
+    const at::Tensor& page_table,
+    float softmax_scale,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    float softcap,
+    int num_kv_splits,
+    std::optional<bool> pack_gqa,
+    int sm_margin,
+    at::Tensor& out) {
+  TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
+  TORCH_CHECK(
+      cu_seqlens_q.dim() == 1 && cache_seqlens.dim() == 1, "cu_seqlens_q and cache_seqlens must be one-dimensional");
+  TORCH_CHECK(
+      cache_seqlens.size(0) + 1 == cu_seqlens_q.size(0), "cache_seqlens must have one length per query sequence");
+  TORCH_CHECK(
+      out.scalar_type() == q.scalar_type() && out.dim() == 3 && out.size(0) == q.size(0) && out.size(1) == q.size(1) &&
+          out.size(2) == v.size(-1),
+      "out shape and dtype must match [total_q, num_heads, head_size_v]");
+  TORCH_CHECK(out.device() == q.device(), "out must be on the same device as q");
+  TORCH_CHECK(out.stride(-1) == 1, "out must have a contiguous last dimension");
+
+#ifndef USE_FMHA_JIT
+  bool const is_simple_swa_decode =
+      q.device().type() == c10::DeviceType::XPU && q.scalar_type() == at::ScalarType::BFloat16 && q.size(1) == 64 &&
+      q.size(2) == 64 && k.scalar_type() == q.scalar_type() && k.dim() == 4 && k.size(1) == 128 && k.size(2) == 8 &&
+      k.size(3) == 64 && v.scalar_type() == q.scalar_type() && v.dim() == 4 && v.size(0) == k.size(0) &&
+      v.size(1) == 128 && v.size(2) == 8 && v.size(3) == 64 && cu_seqlens_q.scalar_type() == at::ScalarType::Int &&
+      cache_seqlens.scalar_type() == at::ScalarType::Int && page_table.dim() == 2 &&
+      page_table.scalar_type() == at::ScalarType::Int && q.size(0) + 1 == cu_seqlens_q.size(0) &&
+      cache_seqlens.size(0) == q.size(0) && page_table.size(0) == q.size(0) && q.stride(-1) == 1 && k.stride(-1) == 1 &&
+      v.stride(-1) == 1 && cu_seqlens_q.stride(-1) == 1 && cache_seqlens.stride(-1) == 1 &&
+      page_table.stride(-1) == 1 && k.device() == q.device() && v.device() == q.device() &&
+      cu_seqlens_q.device() == q.device() && cache_seqlens.device() == q.device() &&
+      page_table.device() == q.device() && !is_causal && window_size_left >= 0 && window_size_right == 0 &&
+      softcap == 0.0f && num_kv_splits <= 1;
+  if (is_simple_swa_decode) {
+    int const seqlen_k = max_seqlen_k > 0 ? max_seqlen_k : static_cast<int>(page_table.size(1)) * 128;
+    int const effective_seqlen_k = std::min(seqlen_k, window_size_left + 1);
+    int const effective_blocks = (effective_seqlen_k + 127) / 128;
+    if (num_kv_splits != 0 || effective_blocks <= 32) {
+      decode::Arguments params{};
+      params.device_id = q.device().index();
+      params.is_bf16 = true;
+      params.q_ptr = q.data_ptr();
+      params.k_ptr = k.data_ptr();
+      params.v_ptr = v.data_ptr();
+      params.q_row_stride = q.stride(-3);
+      params.k_row_stride = k.stride(-3);
+      params.v_row_stride = v.stride(-3);
+      params.q_head_stride = q.stride(-2);
+      params.k_head_stride = k.stride(-2);
+      params.v_head_stride = v.stride(-2);
+      params.k_stride_page = k.stride(0);
+      params.k_stride_seq = k.stride(1);
+      params.k_stride_heads = k.stride(2);
+      params.v_stride_page = v.stride(0);
+      params.v_stride_seq = v.stride(1);
+      params.v_stride_heads = v.stride(2);
+      params.v_dim_stride = v.stride(-1);
+      params.o_ptr = out.data_ptr();
+      params.o_row_stride = out.stride(-3);
+      params.o_head_stride = out.stride(-2);
+      params.cu_seqlens_q = cu_seqlens_q.data_ptr<int>();
+      params.cu_seqlens_k = cache_seqlens.data_ptr<int>();
+      params.return_softmax_lse = false;
+      params.b = q.size(0);
+      params.h = 64;
+      params.h_k = 8;
+      params.q_group_size = 8;
+      params.num_kv_splits = 1;
+      params.seqlen_q = 1;
+      params.seqlen_k = seqlen_k;
+      params.d = 64;
+      params.d_rounded = 64;
+      params.softmax_scale = softmax_scale;
+      params.use_sink = false;
+      params.softmax_sink_ptr = nullptr;
+      params.softcap = 0.0f;
+      params.p_dropout = 1.0f;
+      params.is_causal = false;
+      params.is_local = true;
+      params.window_size_left = std::min(window_size_left, seqlen_k - 1);
+      params.window_size_right = 0;
+      params.total_q = q.size(0);
+      params.total_k = k.size(0) * 128;
+      params.b_k = page_table.size(0);
+      params.dv = 64;
+      params.page_table = page_table.data_ptr<int>();
+      params.page_table_batch_stride = page_table.stride(0);
+      params.max_num_pages_per_seq = page_table.size(1);
+      params.page_size = 128;
+      params.num_pages = k.size(0);
+      params.rotary_dim = 0;
+      params.tensor_opts = torch::TensorOptions().dtype(torch::kUInt8).device(q.device());
+      decode::FmhaDecodeRunner<8, 64, 128>{}(params);
+      return;
+    }
+  }
+#endif
+
+  std::optional<const at::Tensor> absent_input;
+  std::optional<const at::Tensor> page_table_opt{page_table};
+  std::optional<at::Tensor> absent_output;
+  decode::mha_fwd(
+      q,
+      k,
+      v,
+      absent_input,
+      cu_seqlens_q,
+      cache_seqlens,
+      1,
+      max_seqlen_k,
+      page_table_opt,
+      absent_input,
+      absent_input,
+      absent_input,
+      absent_input,
+      absent_input,
+      absent_output,
+      absent_output,
+      absent_output,
+      softmax_scale,
+      absent_input,
+      is_causal,
+      window_size_left,
+      window_size_right,
+      softcap,
+      true,
+      absent_output,
+      num_kv_splits,
+      pack_gqa,
+      sm_margin,
+      out,
+      absent_output,
+      std::nullopt,
+      absent_input,
+      false);
+}
+
+SGL_KERNEL_EXPORT at::Tensor mha_fwd_paged_decode_alloc(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& cache_seqlens,
+    int max_seqlen_k,
+    const at::Tensor& page_table,
+    float softmax_scale,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    float softcap,
+    int num_kv_splits,
+    std::optional<bool> pack_gqa,
+    int sm_margin) {
+  TORCH_CHECK(q.dim() == 3, "query must be in ragged format (total_q, h, d)");
+  auto out = at::empty({q.size(0), q.size(1), v.size(-1)}, q.options());
+  mha_fwd_paged_decode(
+      q,
+      k,
+      v,
+      cu_seqlens_q,
+      cache_seqlens,
+      max_seqlen_k,
+      page_table,
+      softmax_scale,
+      is_causal,
+      window_size_left,
+      window_size_right,
+      softcap,
+      num_kv_splits,
+      pack_gqa,
+      sm_margin,
+      out);
+  return out;
 }
 #undef SYCL_INTEL_TARGET

@@ -84,6 +84,41 @@ void mha_fwd(
     std::optional<const at::Tensor>& rel_bias_,
     bool rel_bias_is_sheared);
 
+void mha_fwd_paged_decode(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& cache_seqlens,
+    int max_seqlen_k,
+    const at::Tensor& page_table,
+    float softmax_scale,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    float softcap,
+    int num_kv_splits,
+    std::optional<bool> pack_gqa,
+    int sm_margin,
+    at::Tensor& out);
+
+at::Tensor mha_fwd_paged_decode_alloc(
+    const at::Tensor& q,
+    const at::Tensor& k,
+    const at::Tensor& v,
+    const at::Tensor& cu_seqlens_q,
+    const at::Tensor& cache_seqlens,
+    int max_seqlen_k,
+    const at::Tensor& page_table,
+    float softmax_scale,
+    bool is_causal,
+    int window_size_left,
+    int window_size_right,
+    float softcap,
+    int num_kv_splits,
+    std::optional<bool> pack_gqa,
+    int sm_margin);
+
 void flash_mla_decode(
     torch::Tensor& out,
     const std::optional<torch::Tensor>& lse,  // (batch, num_heads) fp32; nullopt = skip

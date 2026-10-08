@@ -59,6 +59,16 @@ constexpr int slm_byte_budget = 384 * 1024;  // Xe35: 384 KiB SLM
 #error "Unsupported SYCL_INTEL_TARGET for decode SLM budget"
 #endif
 
+inline int cached_multiprocessor_count(int device_id) {
+  thread_local int cached_device_id = -1;
+  thread_local int cached_count = 0;
+  if (cached_device_id != device_id) {
+    cached_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(device_id);
+    cached_device_id = device_id;
+  }
+  return cached_count;
+}
+
 // Number of subgroups the KV (page) tile is split across, capped so the epilogue
 // cross-subgroup reduction buffer fits in shared local memory.
 //
@@ -91,6 +101,8 @@ constexpr int kv_subgroups_for_slm(int full_kv_subgroups, int qg, int head_dim_r
 }
 
 struct Arguments {
+  int device_id = 0;
+
   // The QKV matrices.
   void* __restrict__ q_ptr;
   void* __restrict__ k_ptr;
@@ -449,20 +461,25 @@ struct DecodeRunner {
 
     // Define device-global scratch memory
     size_t workspace_size = FMHADecodeKernel::get_workspace_size(arguments);
-    auto workspace = torch::empty(workspace_size, params.tensor_opts);
+    torch::Tensor workspace;
+    void* workspace_ptr = nullptr;
+    if (workspace_size > 0) {
+      workspace = torch::empty(workspace_size, params.tensor_opts);
+      workspace_ptr = workspace.data_ptr();
+    }
 
     if (!FMHADecodeKernel::can_implement(arguments)) {
       return cutlass::Status::kErrorInvalidProblem;
     }
 
     // Initialize the workspace
-    FMHADecodeKernel::initialize_workspace(arguments, workspace.data_ptr());
+    FMHADecodeKernel::initialize_workspace(arguments, workspace_ptr);
 
     // Convert host-side arguments to device-side arguments to be passed to the kernel
-    auto kernel_params = FMHADecodeKernel::to_underlying_arguments(arguments, workspace.data_ptr());
+    auto kernel_params = FMHADecodeKernel::to_underlying_arguments(arguments, workspace_ptr);
 
     // Run
-    launch<FMHADecodeKernel>(kernel_params);
+    launch<FMHADecodeKernel>(kernel_params, hw_info.device_id);
     return cutlass::Status::kSuccess;
   }
 };
@@ -646,9 +663,14 @@ struct SplitDecodeKernelRunner {
     // Define device-global scratch memory
     size_t workspace_size = FMHAKernel::get_workspace_size(arguments);
     size_t reduce_workspace_size = ReductionSplitKernel::get_workspace_size(reduce_arg);
-    torch::Tensor workspace = torch::empty(
-        {static_cast<int64_t>(workspace_size + reduce_workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
-    uint8_t* workspace_ptr = static_cast<uint8_t*>(workspace.data_ptr());
+    torch::Tensor workspace;
+    uint8_t* workspace_ptr = nullptr;
+    const size_t total_workspace_size = workspace_size + reduce_workspace_size;
+    if (total_workspace_size > 0) {
+      workspace =
+          torch::empty({static_cast<int64_t>(total_workspace_size)}, torch::device(torch::kXPU).dtype(torch::kByte));
+      workspace_ptr = static_cast<uint8_t*>(workspace.data_ptr());
+    }
 
     TORCH_CHECK(
         params.num_kv_splits <= FMHAKernel::max_num_kv_splits,
@@ -674,20 +696,27 @@ struct SplitDecodeKernelRunner {
     // Convert host-side arguments to device-side arguments to be passed to the
     // kernel
     auto kernel_params = FMHAKernel::to_underlying_arguments(arguments, workspace_ptr);
-    auto reduce_params = ReductionSplitKernel::to_underlying_arguments(reduce_arg, workspace_ptr + workspace_size);
+    auto* reduce_workspace_ptr = workspace_ptr;
+    if (workspace_size > 0) {
+      reduce_workspace_ptr += workspace_size;
+    }
+    auto reduce_params = ReductionSplitKernel::to_underlying_arguments(reduce_arg, reduce_workspace_ptr);
 
-    ReductionSplitKernel::initialize_workspace(reduce_arg, workspace_ptr + workspace_size);
-    run(kernel_params, reduce_params, params.num_kv_splits > 1);
+    ReductionSplitKernel::initialize_workspace(reduce_arg, reduce_workspace_ptr);
+    run(kernel_params, reduce_params, params.num_kv_splits > 1, hw_info.device_id);
 
     return cutlass::Status::kSuccess;
   }
 
   static void
-  run(typename FMHAKernel::Params params, typename ReductionSplitKernel::Params reduce_params, bool need_reduce) {
-    launch<FMHAKernel>(params);
+  run(typename FMHAKernel::Params params,
+      typename ReductionSplitKernel::Params reduce_params,
+      bool need_reduce,
+      c10::DeviceIndex device_id) {
+    launch<FMHAKernel>(params, device_id);
 
     if (need_reduce) {
-      launch<ReductionSplitKernel>(reduce_params);
+      launch<ReductionSplitKernel>(reduce_params, device_id);
     }
   }
 };
@@ -739,7 +768,8 @@ struct DecodeConfig {
     // The KernelHardwareInfo struct holds the number of EUs on the GPU with a given device ID. This
     // information is used by the underlying kernel.
     cutlass::KernelHardwareInfo hw_info;
-    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+    hw_info.device_id = params.device_id;
+    hw_info.sm_count = cached_multiprocessor_count(hw_info.device_id);
 
     using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<isVarLen>;
 
@@ -888,7 +918,8 @@ struct SplitDecodeConfig {
     // constexpr bool isVarLen = true;
     // constexpr bool PagedKV = true;
     cutlass::KernelHardwareInfo hw_info;
-    hw_info.sm_count = cutlass::KernelHardwareInfo::query_device_multiprocessor_count(hw_info.device_id);
+    hw_info.device_id = params.device_id;
+    hw_info.sm_count = cached_multiprocessor_count(hw_info.device_id);
 
     using ProblemShapeType = cutlass::fmha::kernel::FMHAProblemShape<isVarLen>;
 

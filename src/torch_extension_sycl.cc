@@ -440,6 +440,21 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "    Tensor?  rel_bias=None,"
       "    bool     rel_bias_is_sheared=False) -> ()");
   m.impl("fwd", torch::kXPU, make_pytorch_shim(&mha_fwd));
+
+  m.def(
+      "fwd_paged_decode(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, "
+      "Tensor cache_seqlens, int max_seqlen_k, Tensor page_table, "
+      "float softmax_scale, bool is_causal, int window_size_left, "
+      "int window_size_right, float softcap, int num_kv_splits, "
+      "bool? pack_gqa, int sm_margin, Tensor(a!) out) -> ()");
+  m.impl("fwd_paged_decode", torch::kXPU, make_pytorch_shim(&mha_fwd_paged_decode));
+  m.def(
+      "fwd_paged_decode_alloc(Tensor q, Tensor k, Tensor v, Tensor cu_seqlens_q, "
+      "Tensor cache_seqlens, int max_seqlen_k, Tensor page_table, "
+      "float softmax_scale, bool is_causal, int window_size_left, "
+      "int window_size_right, float softcap, int num_kv_splits, "
+      "bool? pack_gqa, int sm_margin) -> Tensor");
+  m.impl("fwd_paged_decode_alloc", torch::kXPU, make_pytorch_shim(&mha_fwd_paged_decode_alloc));
 #endif  // USE_FMHA
 
 #ifdef USE_MLA

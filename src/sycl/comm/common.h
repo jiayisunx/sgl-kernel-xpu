@@ -59,7 +59,7 @@ template <typename Kernel>
 class KernelCur {};
 
 template <typename Kernel, int GrfSize = 256>
-static void launch(typename Kernel::Params params) {
+static void launch(typename Kernel::Params params, c10::DeviceIndex device_id = -1) {
   static_assert(GrfSize == 128 || GrfSize == 256, "GRF size must be 128 or 256");
 
   compat::dim3 const block = Kernel::get_block_shape();
@@ -82,7 +82,7 @@ static void launch(typename Kernel::Params params) {
       syclex::sub_group_size<cute::intel::sg_size>, intelex::grf_size<GrfSize>};
 
   compat::experimental::launch_policy policy{sycl_grid, sycl_block, launch_props, kernel_props};
-  auto stream = at::xpu::getCurrentXPUStream();
+  auto stream = at::xpu::getCurrentXPUStream(device_id);
   auto q = stream.queue();
 #if defined(CUTLASS_SYCL_PROFILING_ENABLED)
   // Capture the SYCL event and register it with EventManager so the
@@ -92,7 +92,7 @@ static void launch(typename Kernel::Params params) {
   auto event = compat::experimental::launch<cutlass::device_kernel<Kernel>, KernelCur<Kernel>>(policy, q, params);
   EventManager::getInstance().addEvent(event);
 #else
-  compat::experimental::launch<cutlass::device_kernel<Kernel>, KernelCur<Kernel>>(policy, q, params);
+  compat::experimental::launch<cutlass::device_kernel<Kernel>, KernelCur<Kernel>, false>(policy, q, params);
 #endif
 }
 
